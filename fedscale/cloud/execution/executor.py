@@ -5,10 +5,13 @@ import pickle
 import random
 import time
 from argparse import Namespace
+import copy
 
 import numpy as np
 import torch
 import wandb
+import grpc
+import logging
 
 import fedscale.cloud.channels.job_api_pb2 as job_api_pb2
 import fedscale.cloud.logger.executor_logging as logger
@@ -19,7 +22,7 @@ from fedscale.cloud.execution.data_processor import collate, voice_collate_fn
 from fedscale.cloud.execution.rl_client import RLClient
 from fedscale.cloud.fllibs import *
 from fedscale.dataloaders.divide_data import DataPartitioner, select_dataset
-
+import gzip
 
 class Executor(object):
     """Abstract class for FedScale executor.
@@ -42,6 +45,14 @@ class Executor(object):
         # ======== env information ========
         self.this_rank = args.this_rank
         self.executor_id = str(self.this_rank)
+
+
+        # === 2) grab the very first global weights
+        #     (deepcopy because we’ll mutate local_weights in‐place)
+        self.global_weights = copy.deepcopy(self.model_adapter.get_weights())
+        self.local_weights  = copy.deepcopy(self.global_weights)
+        self.alpha = 0.5
+
 
         # ======== model and data ========
         self.training_sets = self.test_dataset = None
@@ -168,7 +179,10 @@ class Executor(object):
             ServerResponse defined at job_api.proto: The deserialized response object from server.
 
         """
-        return pickle.loads(responses)
+        # return pickle.loads(responses)
+        raw = gzip.decompress(responses)
+        return pickle.loads(raw)
+
 
     def serialize_response(self, responses):
         """Serialize the response to send to server upon assigned job completion
@@ -180,7 +194,9 @@ class Executor(object):
             bytes stream: The serialized response object to server.
 
         """
-        return pickle.dumps(responses)
+        # return pickle.dumps(responses)
+        raw = pickle.dumps(responses)
+        return gzip.compress(raw)
 
     def UpdateModel(self, model_weights):
         """Receive the broadcasted global model for current round
@@ -206,26 +222,111 @@ class Executor(object):
 
         if "model" not in config or not config["model"]:
             raise "The 'model' object must be a non-null value in the training config."
+        
+        # 1) pull the server's broadcast into self.global_weights
+        global_blob = config["model"]
+        self.global_weights = global_blob
+
+
+        # 1. Evaluate both local and global performance
+        local_acc = self.evaluate_model(self.local_weights)
+        global_acc = self.evaluate_model(self.global_weights)
+
+        # 2. Adjust alpha if local outperforms global significantly
+        threshold = 0.02  # tunable hyperparameter
+        if local_acc - global_acc > threshold:
+            self.alpha = min(self.alpha + 0.1, 1.0)
+        elif global_acc - local_acc > threshold:
+            self.alpha = max(self.alpha - 0.1, 0.0)
+
+        logging.info(f"[Executor:{self.executor_id}] Adjusted α = {self.alpha:.2f}")
+
+
+        # 2) mix local + global via α
+        mixed = [
+            self.alpha * lw + (1 - self.alpha) * gw
+            for lw, gw in zip(self.local_weights, self.global_weights)
+        ]
+        # set that as the model you actually train
+        self.model_adapter.set_weights(mixed, is_aggregator=False)
+
+
+
         client_conf = self.override_conf(train_config)
         train_res = self.training_handler(
-            client_id=client_id, conf=client_conf, model=config["model"]
+            client_id=client_id, conf=client_conf, model=mixed
         )
 
-        # Report execution completion meta information
-        response = self.aggregator_communicator.stub.CLIENT_EXECUTE_COMPLETION(
-            job_api_pb2.CompleteRequest(
-                client_id=str(client_id),
-                executor_id=self.executor_id,
-                event=commons.CLIENT_TRAIN,
-                status=True,
-                msg=None,
-                meta_result=None,
-                data_result=None,
+        self.local_weights = self.model_adapter.get_weights()
+        
+
+        if not isinstance(train_res, dict):
+            temp_train_res = {}
+            train_res = temp_train_res
+
+        train_res['client_eval_local_acc'] = local_acc   # local_acc was calculated earlier in Train
+        train_res['client_eval_global_acc'] = global_acc # global_acc was calculated earlier in Train
+        train_res['client_alpha'] = self.alpha          # self.alpha was calculated earlier in Train
+
+        logging.info(f"Got local weights of size {len(pickle.dumps(self.local_weights))/1e6:.2f} MB")
+
+        try:
+            logging.info("About to call CLIENT_EXECUTE_COMPLETION...")
+            # Report execution completion meta information
+            response = self.aggregator_communicator.stub.CLIENT_EXECUTE_COMPLETION(
+                job_api_pb2.CompleteRequest(
+                    client_id=str(client_id),
+                    executor_id=self.executor_id,
+                    event=commons.CLIENT_TRAIN,
+                    status=True,
+                    msg=None,
+                    meta_result=None,
+                    data_result=None,
+                )
             )
-        )
-        self.dispatch_worker_events(response)
+            self.dispatch_worker_events(response)
+
+        except grpc.RpcError as e:
+            logging.error(f"gRPC error details:")
+            logging.error(f"  Error code: {e.code()}")
+            logging.error(f"  Error details: {e.details()}")
+            logging.error(f"  Error debug string: {e.debug_error_string()}")
+            if hasattr(e, 'initial_metadata'):
+                logging.error(f"  Initial metadata: {e.initial_metadata()}")
+            if hasattr(e, 'trailing_metadata'):
+                logging.error(f"  Trailing metadata: {e.trailing_metadata()}")
+            
+            if e.code() == grpc.StatusCode.UNAVAILABLE:
+                logging.error("Aggregator went away—reconnecting or exiting")
+            elif e.code() == grpc.StatusCode.RESOURCE_EXHAUSTED:
+                logging.error("gRPC message size limit exceeded")
+            else:
+                logging.error(f"Unexpected gRPC error: {e}")
+
 
         return client_id, train_res
+
+
+    def evaluate_model(self, weights):
+        """Evaluate given weights on local test set and return accuracy or loss."""
+        self.model_adapter.set_weights(weights, is_aggregator=False)
+        test_config = self.override_conf({
+            "rank": self.this_rank,
+            "tokenizer": tokenizer,
+        })
+        client = self.get_client_trainer(test_config)
+        data_loader = select_dataset(
+            self.this_rank,
+            self.testing_sets,
+            batch_size=self.args.test_bsz,
+            args=self.args,
+            isTest=True,
+            collate_fn=self.collate_fn,
+        )
+        res = client.test(data_loader, model=self.model_adapter.get_model(), conf=test_config)
+        return res["top_1"] / res["test_len"]  # or use res["test_loss"] / res["test_len"]
+
+
 
     def Test(self, config):
         """Model Testing. By default, we test the accuracy on all data of clients in the test group
@@ -329,7 +430,8 @@ class Executor(object):
         train_res = client.train(
             client_data=client_data, model=self.model_adapter.get_model(), conf=conf
         )
-
+        print(f"loss curve from train_res for client: is {train_res['loss_curve']}")
+        # logging.info(f"train_res for client: is {train_res}")
         return train_res
 
     def testing_handler(self, model):
@@ -392,73 +494,198 @@ class Executor(object):
 
     def client_ping(self):
         """Ping the aggregator for new task"""
-        response = self.aggregator_communicator.stub.CLIENT_PING(
-            job_api_pb2.PingRequest(
-                client_id=self.executor_id, executor_id=self.executor_id
+        try:
+            print(f"[Executor] calling CLIENT_PING…")
+            response = self.aggregator_communicator.stub.CLIENT_PING(
+                job_api_pb2.PingRequest(
+                    client_id=self.executor_id, executor_id=self.executor_id
+                )
             )
-        )
-        self.dispatch_worker_events(response)
+            # after we get a raw ServerResponse proto…
+            logging.debug(f"[Executor] CLIENT_PING ← event={response.event!r} "
+                        f"meta={len(response.meta)} bytes data={len(response.data)} bytes")
+        
+            self.dispatch_worker_events(response)
+        except Exception:
+            logging.exception("🔴 CLIENT_PING failed")
+            raise
+
+    # def event_monitor(self):
+    #     """Activate event handler once receiving new message"""
+    #     logging.info("Start monitoring events ...")
+    #     self.client_register()
+
+    #     while not self.received_stop_request:
+    #         if len(self.event_queue) > 0:
+    #             request = self.event_queue.popleft()
+    #             current_event = request.event
+
+    #             if current_event == commons.CLIENT_TRAIN:
+    #                 train_config = self.deserialize_response(request.meta)
+    #                 train_model = self.deserialize_response(request.data)
+    #                 train_config["model"] = train_model
+    #                 train_config["client_id"] = int(train_config["client_id"])
+    #                 client_id, train_res = self.Train(train_config)
+
+    #                 # Upload model updates
+    #                 future_call = self.aggregator_communicator.stub.CLIENT_EXECUTE_COMPLETION.future(
+    #                     job_api_pb2.CompleteRequest(
+    #                         client_id=str(client_id),
+    #                         executor_id=self.executor_id,
+    #                         event=commons.UPLOAD_MODEL,
+    #                         status=True,
+    #                         msg=None,
+    #                         meta_result=None,
+    #                         data_result=self.serialize_response(train_res),
+    #                     )
+    #                 )
+    #                 future_call.add_done_callback(
+    #                     lambda _response: self.dispatch_worker_events(
+    #                         _response.result()
+    #                     )
+    #                 )
+
+    #             elif current_event == commons.MODEL_TEST:
+    #                 # test_config = self.deserialize_response(request.meta)
+    #                 # test_model = self.deserialize_response(request.data)
+    #                 test_config = self.deserialize_response(request.meta)
+    #                 test_config["model"]   = self.global_weights
+    #                 test_config["client_id"] = int(test_config["client_id"])
+    #                 self.Test(test_config)
+
+    #             elif current_event == commons.UPDATE_MODEL:
+    #                 # model_weights = self.deserialize_response(request.data)
+    #                 # self.UpdateModel(model_weights)   
+
+    #                 stream = self.aggregator_communicator.stub.StreamUpdateModel(
+    #                     job_api_pb2.PingRequest(
+    #                         client_id   = self.executor_id,
+    #                         executor_id = self.executor_id
+    #                     )
+    #                 )
+    #                 compressed = b"".join(chunk.payload for chunk in stream)
+    #                 # Decompress & deserialize
+    #                 raw = gzip.decompress(compressed)
+    #                 model_weights = pickle.loads(raw)
+    #                 self.UpdateModel(model_weights)
+
+    #             elif current_event == commons.SHUT_DOWN:
+    #                 self.Stop()
+    #                 break
+
+    #             elif current_event == commons.DUMMY_EVENT:
+    #                 pass
+    #         else:
+    #             time.sleep(1)
+    #             try:
+    #                 self.client_ping()
+    #             except Exception as e:
+    #                 logging.info(
+    #                     f"Caught exception {e} from aggregator, terminating executor {self.this_rank} ..."
+    #                 )
+    #                 self.Stop()
+
 
     def event_monitor(self):
         """Activate event handler once receiving new message"""
-        logging.info("Start monitoring events ...")
+        logging.info("Start monitoring events …")
+        # 1) Register with the aggregator
         self.client_register()
 
-        while not self.received_stop_request:
-            if len(self.event_queue) > 0:
-                request = self.event_queue.popleft()
-                current_event = request.event
+        # Pre-build a PingRequest so we don't repeatedly construct it
+        ping_req = job_api_pb2.PingRequest(
+            client_id   = self.executor_id,
+            executor_id = self.executor_id,
+        )
 
-                if current_event == commons.CLIENT_TRAIN:
-                    train_config = self.deserialize_response(request.meta)
-                    train_model = self.deserialize_response(request.data)
-                    train_config["model"] = train_model
-                    train_config["client_id"] = int(train_config["client_id"])
-                    client_id, train_res = self.Train(train_config)
+        while True:
+            try:
+                # If shutdown was requested inside Train/Test/etc, break
+                if self.received_stop_request:
+                    break
 
-                    # Upload model updates
-                    future_call = self.aggregator_communicator.stub.CLIENT_EXECUTE_COMPLETION.future(
-                        job_api_pb2.CompleteRequest(
-                            client_id=str(client_id),
-                            executor_id=self.executor_id,
-                            event=commons.UPLOAD_MODEL,
-                            status=True,
-                            msg=None,
-                            meta_result=None,
-                            data_result=self.serialize_response(train_res),
-                        )
-                    )
-                    future_call.add_done_callback(
-                        lambda _response: self.dispatch_worker_events(
-                            _response.result()
-                        )
-                    )
+                # 2) Handle any queued ServerResponse events
+                if self.event_queue:
+                    request = self.event_queue.popleft()
+                    current_event = request.event
 
-                elif current_event == commons.MODEL_TEST:
-                    test_config = self.deserialize_response(request.meta)
-                    test_model = self.deserialize_response(request.data)
-                    test_config["model"] = test_model
-                    test_config["client_id"] = int(test_config["client_id"])
-                    self.Test(test_config)
+                    if current_event == commons.CLIENT_TRAIN:
+                        cfg = self.deserialize_response(request.meta)
+                        model_blob = self.deserialize_response(request.data)
+                        cfg["model"]     = model_blob
+                        cfg["client_id"] = int(cfg["client_id"])
+                        client_id, train_res = self.Train(cfg)
 
-                elif current_event == commons.UPDATE_MODEL:
-                    model_weights = self.deserialize_response(request.data)
-                    self.UpdateModel(model_weights)
+                        raw_payload = self.serialize_response(train_res)
+                        logging.info(f"[Executor:{self.executor_id}] Will upload train_res payload of {len(raw_payload)/1e6:.2f} MB")
+                        # upload asynchronously
+                        # future = self.aggregator_communicator.stub.CLIENT_EXECUTE_COMPLETION.future(
+                        #     job_api_pb2.CompleteRequest(
+                        #         client_id    = str(client_id),
+                        #         executor_id  = self.executor_id,
+                        #         event        = commons.UPLOAD_MODEL,
+                        #         status       = True,
+                        #         meta_result  = None,
+                        #         data_result  = raw_payload,
 
-                elif current_event == commons.SHUT_DOWN:
-                    self.Stop()
+                        #     )
+                        # )
+                        # future.add_done_callback(lambda f: self.dispatch_worker_events(f.result()))
+                        raw      = pickle.dumps(train_res)
+                        compressed = gzip.compress(raw)
+                        chunk_size = 1 << 20
+                        def chunker():
+                            for offset in range(0, len(compressed), chunk_size):
+                                yield job_api_pb2.ModelChunk(
+                                    payload = compressed[offset:offset+chunk_size],
+                                    seq_num = offset // chunk_size
+                                )
+                        ack = self.aggregator_communicator.stub.UploadModel(chunker())
+                        logging.info(f"[Executor:{self.executor_id}] UploadModel RPC completed.")
 
-                elif current_event == commons.DUMMY_EVENT:
-                    pass
-            else:
-                time.sleep(1)
-                try:
-                    self.client_ping()
-                except Exception as e:
-                    logging.info(
-                        f"Caught exception {e} from aggregator, terminating executor {self.this_rank} ..."
-                    )
-                    self.Stop()
+                        fake_resp = job_api_pb2.ServerResponse(event=commons.DUMMY_EVENT, meta=b'', data=b'')
+                        self.dispatch_worker_events(fake_resp)
+                        # future.add_done_callback(
+                        #     lambda resp: logging.info(f"[Executor:{self.executor_id}] UploadModel RPC completed: event={resp.result().event!r}")
+                        # )
+
+                    elif current_event == commons.MODEL_TEST:
+                        cfg = self.deserialize_response(request.meta)
+                        cfg["model"]     = self.global_weights
+                        cfg["client_id"] = int(cfg["client_id"])
+                        self.Test(cfg)
+
+                    elif current_event == commons.UPDATE_MODEL:
+                        # stream in new global weights
+                        stream = self.aggregator_communicator.stub.StreamUpdateModel(ping_req)
+                        compressed = b"".join(chunk.payload for chunk in stream)
+                        raw = gzip.decompress(compressed)
+                        weights = pickle.loads(raw)
+                        self.UpdateModel(weights)
+
+                    elif current_event == commons.SHUT_DOWN:
+                        logging.info("Received SHUT_DOWN from server; stopping executor.")
+                        break
+
+                    # DUMMY_EVENT → nothing to do
+                    # elif current_event == commons.DUMMY_EVENT:
+                    #     pass
+
+                else:
+                    # 3) No events queued → poll the server
+                    time.sleep(1)
+                    resp = self.aggregator_communicator.stub.CLIENT_PING(ping_req)
+                    self.dispatch_worker_events(resp)
+
+            except grpc.RpcError as e:
+                logging.info(f"gRPC error {e!r}; exiting event loop.")
+                break
+
+        # 4) Clean up
+        self.Stop()
+
+
+
 
     def log_test_result(self, test_res):
         """Log test results to wandb server if enabled"""

@@ -7,6 +7,7 @@ import pickle
 import random
 import threading
 import time
+import gzip
 from concurrent import futures
 
 import grpc
@@ -15,7 +16,10 @@ import torch
 import wandb
 from torch.utils.tensorboard import SummaryWriter
 
+import fedscale.cloud.channels.job_api_pb2     as job_api_pb2
 import fedscale.cloud.channels.job_api_pb2_grpc as job_api_pb2_grpc
+
+import logging
 import fedscale.cloud.logger.aggregator_logging as logger
 from fedscale.cloud.aggregation.optimizers import TorchServerOptimizer
 from fedscale.cloud.channels import job_api_pb2
@@ -45,7 +49,7 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
         self.args = args
         self.experiment_mode = args.experiment_mode
         self.device = args.cuda_device if args.use_cuda else torch.device("cpu")
-
+        self._history = {}
         # ======== env information ========
         self.this_rank = 0
         self.global_virtual_clock = 0.0
@@ -179,6 +183,12 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
             options=[
                 ("grpc.max_send_message_length", MAX_MESSAGE_LENGTH),
                 ("grpc.max_receive_message_length", MAX_MESSAGE_LENGTH),
+                # allow executors up to 5 min between pings
+                ("grpc.keepalive_time_ms",               300_000),
+                # wait up to 60 s for a pong before closing
+                ("grpc.keepalive_timeout_ms",             60_000),
+                # let executors ping without active RPC
+                ("grpc.keepalive_permit_without_calls",     1),
             ],
         )
         job_api_pb2_grpc.add_JobServiceServicer_to_server(self, self.grpc_server)
@@ -271,8 +281,10 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
             info (dictionary): Executor information
 
         """
-        logging.info(f"Loading {len(info['size'])} client traces ...")
+        # logging.info(f"Loading {len(info['size'])} client traces ...")
+        # print(f"[DEBUG] Executor ID: {executorId}, Info received: {info}")
         for _size in info["size"]:
+            # print(f"[DEBUG] Registering client with data size: {_size}")
             # since the worker rankId starts from 1, we also configure the initial dataId as 1
             mapped_id = (
                 (self.num_of_clients + 1) % len(self.client_profiles)
@@ -283,11 +295,16 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
                 mapped_id, {"computation": 1.0, "communication": 1.0}
             )
 
+            # print(f"[DEBUG] Mapped system profile: {systemProfile}")
+
             client_id = (
                 (self.num_of_clients + 1)
                 if self.experiment_mode == commons.SIMULATION_MODE
                 else executorId
             )
+
+            # print(f"[DEBUG] Registering Client ID: {client_id} under Executor: {executorId}")
+
             self.client_manager.register_client(
                 executorId, client_id, size=_size, speed=systemProfile
             )
@@ -298,11 +315,15 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
                 upload_size=self.model_update_size,
                 download_size=self.model_update_size,
             )
+
+            # print(f"[DEBUG] Client {client_id} registered with size {_size}")
+
             self.num_of_clients += 1
 
-        logging.info(
-            "Info of all feasible clients {}".format(self.client_manager.getDataInfo())
-        )
+        # logging.info(
+        #     "Info of all feasible clients {}".format(self.client_manager.getDataInfo())
+        # )
+        # print(f"[DEBUG] Current ClientManager Data Info: {self.client_manager.getDataInfo()}")
 
     def executor_info_handler(self, executorId, info):
         """Handler for register executor info and it will start the round after number of
@@ -459,11 +480,16 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
             results (dictionary): client's training result
 
         """
+        print(f"Inside client_completion_handler for round {self.round}")
         # Format:
         #       -results = {'client_id':client_id, 'update_weight': model_param, 'moving_loss': round_train_loss,
         #       'trained_size': count, 'wall_duration': time_cost, 'success': is_success 'utility': utility}
 
+        results["round"] = self.round
+
         if self.args.gradient_policy in ["q-fedavg"]:
+            self.client_training_results.append(results)
+        else:
             self.client_training_results.append(results)
         # Feed metrics to client sampler
         self.stats_util_accumulator.append(results["utility"])
@@ -561,8 +587,28 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
         """Triggered upon the round completion, it registers the last round execution info,
         broadcast new tasks for executors and select clients for next round.
         """
+        print(f"Inside round_completion_handler.")
+        # print(f"self.client_training_results: {self.client_training_results}")
+
         self.global_virtual_clock += self.round_duration
+        
+        self._history[self.round] = list(self.client_training_results)
+
+        print(f"Inside round_completion_handler for round {self.round}")
+
+        entries = self._history.get(self.round, [])
+        if not entries:
+            print(f"No client entries in history for round {self.round}")
+        else:
+            first = entries[0]
+            # print just the attributes (keys)
+            print(f"History for round {self.round} entry attributes:", list(first.keys()))
+            # if there’s a loss_curve, print it
+            if "loss_curve" in first:
+                print("  loss_curve:", first["loss_curve"])
+
         self.round += 1
+        
         last_round_avg_util = sum(self.stats_util_accumulator) / max(
             1, len(self.stats_util_accumulator)
         )
@@ -625,6 +671,8 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
         self.update_default_task_config()
 
         if self.round >= self.args.rounds:
+            logging.info(f"Reached max rounds ({self.round}); broadcasting SHUT_DOWN")
+            print(f"Reached max rounds ({self.round}); broadcasting SHUT_DOWN")
             self.broadcast_aggregator_events(commons.SHUT_DOWN)
         elif self.round % self.args.eval_interval == 0 or self.round == 1:
             self.broadcast_aggregator_events(commons.UPDATE_MODEL)
@@ -701,7 +749,9 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
         Returns:
             string, bool, or bytes: The deserialized response object from executor.
         """
-        return pickle.loads(responses)
+        # return pickle.loads(responses)
+        raw = gzip.decompress(responses)
+        return pickle.loads(raw)
 
     def serialize_response(self, responses):
         """Serialize the response to send to server upon assigned job completion
@@ -713,7 +763,11 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
             bytes: The serialized response object to server.
 
         """
-        return pickle.dumps(responses)
+        # return pickle.dumps(responses)
+        raw = pickle.dumps(responses)
+        compressed = gzip.compress(raw)
+        # print(f"[DEBUG] payload {len(raw)/1024/1024:.1f} MB → {len(compressed)/1024/1024:.1f} MB")
+        return gzip.compress(raw)
 
     def testing_completion_handler(self, client_id, results):
         """Each executor will handle a subset of testing dataset
@@ -839,6 +893,7 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
         """
         self.server_events_queue.append((client_id, event, meta, data))
 
+
     def CLIENT_REGISTER(self, request, context):
         """FL TorchClient register to the aggregator
 
@@ -899,8 +954,10 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
                         )
             elif current_event == commons.MODEL_TEST:
                 response_msg, response_data = self.get_test_config(client_id)
+                response_data = commons.DUMMY_RESPONSE
             elif current_event == commons.UPDATE_MODEL:
-                response_data = self.model_wrapper.get_weights()
+                # response_data = self.model_wrapper.get_weights()
+                response_data = commons.DUMMY_RESPONSE
             elif current_event == commons.SHUT_DOWN:
                 response_msg = self.get_shutdown_config(executor_id)
 
@@ -926,41 +983,52 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
             ServerResponse: Server response to job completion request
 
         """
+        print(f"[DEBUG] Received EXECUTE_COMPLETION from executor={request.executor_id}, client={request.client_id}, event={request.event}, status={request.status}")
 
-        executor_id, client_id, event = (
-            request.executor_id,
-            request.client_id,
-            request.event,
-        )
-        execution_status, execution_msg = request.status, request.msg
-        meta_result, data_result = request.meta_result, request.data_result
+        try:
+            executor_id, client_id, event = (
+                request.executor_id,
+                request.client_id,
+                request.event,
+            )
+            payload_len = len(request.data_result) if request.data_result else 0
+            logging.info(f"[Aggregator] → CLIENT_EXECUTE_COMPLETION called: executor={executor_id}, client={client_id}, event={event!r}, payload={payload_len/1e6:.2f} MB")
+            execution_status, execution_msg = request.status, request.msg
+            meta_result, data_result = request.meta_result, request.data_result
 
-        if event == commons.CLIENT_TRAIN:
-            # Training results may be uploaded in CLIENT_EXECUTE_RESULT request later,
-            # so we need to specify whether to ask client to do so (in case of straggler/timeout in real FL).
-            if execution_status is False:
-                logging.error(
-                    f"Executor {executor_id} fails to run client {client_id}, due to {execution_msg}"
-                )
-
-            # TODO: whether we should schedule tasks when client_ping or client_complete
-            if self.resource_manager.has_next_task(executor_id):
-                # NOTE: we do not pop the train immediately in simulation mode,
-                # since the executor may run multiple clients
-                if (
-                    commons.CLIENT_TRAIN
-                    not in self.individual_client_events[executor_id]
-                ):
-                    self.individual_client_events[executor_id].append(
-                        commons.CLIENT_TRAIN
+            if event == commons.CLIENT_TRAIN:
+                # Training results may be uploaded in CLIENT_EXECUTE_RESULT request later,
+                # so we need to specify whether to ask client to do so (in case of straggler/timeout in real FL).
+                if execution_status is False:
+                    logging.error(
+                        f"Executor {executor_id} fails to run client {client_id}, due to {execution_msg}"
                     )
 
-        elif event in (commons.MODEL_TEST, commons.UPLOAD_MODEL):
-            self.add_event_handler(executor_id, event, meta_result, data_result)
-        else:
-            logging.error(f"Received undefined event {event} from client {client_id}")
+                # TODO: whether we should schedule tasks when client_ping or client_complete
+                if self.resource_manager.has_next_task(executor_id):
+                    # NOTE: we do not pop the train immediately in simulation mode,
+                    # since the executor may run multiple clients
+                    if (
+                        commons.CLIENT_TRAIN
+                        not in self.individual_client_events[executor_id]
+                    ):
+                        self.individual_client_events[executor_id].append(
+                            commons.CLIENT_TRAIN
+                        )
 
-        return self.CLIENT_PING(request, context)
+            # elif event in (commons.MODEL_TEST, commons.UPLOAD_MODEL):
+            elif event == commons.MODEL_TEST:
+                logging.info(f"[Aggregator] Queuing event {event!r} from executor {executor_id} (data {len(data_result or b'')/1e6:.2f} MB)")
+                self.add_event_handler(executor_id, event, meta_result, data_result)
+            else:
+                logging.error(f"Received undefined event {event} from client {client_id}")
+
+            print(f"[DEBUG] EXECUTE_COMPLETION done for executor={executor_id}, event={event}")
+            return self.CLIENT_PING(request, context)
+        except Exception as e:
+            logging.error(f"Error in CLIENT_EXECUTE_COMPLETION: {e}")
+            print(f"[DEBUG] Error in CLIENT_EXECUTE_COMPLETION: {e}")
+            raise e
 
     def event_monitor(self):
         """Activate event handler according to the received new message"""
@@ -990,8 +1058,19 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
                     data,
                 ) = self.server_events_queue.popleft()
 
+                logging.info(f"[Aggregator] Dequeued {current_event!r} for client {client_id}; data size={len(data or b'')/1e6:.2f} MB")
+
+
                 if current_event == commons.UPLOAD_MODEL:
-                    self.client_completion_handler(self.deserialize_response(data))
+                    # self.client_completion_handler(self.deserialize_response(data))
+                    try:
+                        logging.info(f"[Aggregator] Deserializing upload payload..")
+                        results = self.deserialize_response(data)
+                        logging.info(f"[Aggregator] Deserialized train_res keys: {list(results.keys())}")
+                    except Exception as e:
+                        logging.error(f"[Aggregator] Failed to decompress or unpickle upload payload: {e}")
+                        raise
+                    self.client_completion_handler(results)
                     if len(self.stats_util_accumulator) == self.tasks_round:
                         self.round_completion_handler()
 
@@ -1008,12 +1087,114 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
                 time.sleep(0.1)
 
     def stop(self):
-        """Stop the aggregator"""
-        logging.info(f"Terminating the aggregator ...")
-        if self.wandb != None:
-            self.wandb.finish()
-        time.sleep(5)
+        """Stop the aggregator and its gRPC server."""
+        # Make sure we really notice this in the logs:
+        print("🛑 Terminating the aggregator …", flush=True)
 
+        # Need to Keep gRPC connection alive so it can work with backend endpoints for dashboard
+        if self.wandb:
+            self.wandb.finish()
+
+        # shut down gRPC and wait for all in-flight RPCs to die
+        stop_future = self.grpc_server.stop(0)      # returns a Future
+        stop_future.wait()                          # block until it’s gone
+        print("✅ gRPC server stopped", flush=True)
+
+
+
+    # -------- your new RPCs for dashboard --------------
+
+    def GetAggregatorStatus(self, request: job_api_pb2.StatusRequest, context):
+        # fill these fields from your in‐memory state
+        return job_api_pb2.StatusReply(
+            current_round       = self.round,
+            is_running          = (self.round < self.args.rounds),
+            global_virtual_clock= self.global_virtual_clock,
+            sampled_clients     = [ str(c) for c in self.sampled_participants ],
+        )
+
+    def GetRoundMetrics(self, request: job_api_pb2.MetricsRequest, context):
+        
+        r = request.round
+        perf = self.testing_history["perf"].get(r)
+        if perf is None:
+            # return a gRPC NOT_FOUND so callers know there’s no data
+            context.abort(
+                grpc.StatusCode.NOT_FOUND,
+                f"No metrics for round {r}"
+            )
+
+        print(f"Inside GetRoundMetrics for round {r}")
+        clients = []
+        client_list = self._history.get(r, [])
+        # print(f"client_list inside GetRoundMetrics for round {r}: {client_list}")
+
+        # for res in self.client_training_results:
+        for res in client_list:
+            # if res.get("round") == r:
+            clients.append(job_api_pb2.ClientMetrics(
+                client_id = res["client_id"],
+                loss      = res["moving_loss"],
+                utility   = res["utility"],
+                duration  = res["wall_duration"],
+                loss_curve   = res.get("loss_curve", []),
+                client_eval_local_acc = res.get("client_eval_local_acc", 0.0), # Use .get() for safety
+                client_eval_global_acc = res.get("client_eval_global_acc", 0.0),
+                client_alpha = res.get("client_alpha", 0.0)
+
+            ))
+
+        return job_api_pb2.MetricsReply(
+            round           = r,
+            test_loss       = perf["loss"],
+            test_accuracy1  = perf["top_1"],
+            test_accuracy5  = perf["top_5"],
+            clients         = clients,
+        )
+
+    def StreamUpdateModel(self, request, context):
+        # serialize & compress once
+        raw       = pickle.dumps(self.model_wrapper.get_weights())
+        compressed= gzip.compress(raw)
+
+        chunk_size = 1 << 20  # 1MB chunks
+        for offset in range(0, len(compressed), chunk_size):
+            yield job_api_pb2.ModelChunk(
+                payload=compressed[offset:offset+chunk_size],
+                seq_num = offset // chunk_size
+            )
+
+
+
+    def UploadModel(self, request_iterator, context):
+        """Receive streamed ModelChunk from client, reassemble, then queue for aggregation."""
+        # 1) Reassemble the compressed bytes
+        logging.info("[Aggregator] → UploadModel RPC invoked")
+        buf = bytearray()
+        for chunk in request_iterator:
+            logging.debug(f"[Aggregator]   got chunk seq={chunk.seq_num} size={len(chunk.payload)} bytes")
+            buf.extend(chunk.payload)
+
+        # 2) Decompress & deserialize to get train_res dict
+        try:
+            raw = gzip.decompress(bytes(buf))
+            train_res = pickle.loads(raw)
+        except Exception as e:
+            logging.error(f"[Aggregator] Failed to decode UploadModel stream: {e}")
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Bad model payload")
+
+        # 3) Queue it just like you did before
+        logging.info(f"[Aggregator] Queued uploaded model from client={train_res.get('client_id')}")
+        self.add_event_handler(
+            str(train_res["client_id"]),  # or however you map executor→client
+            commons.UPLOAD_MODEL,
+            None,
+            bytes(buf),        # compressed pickled payload
+        )
+
+        # 4) Send back an empty Ack
+        return job_api_pb2.Ack()
+    
 
 if __name__ == "__main__":
     aggregator = Aggregator(parser.args)

@@ -71,8 +71,8 @@ parser.add_argument("--save_checkpoint", type=bool, default=False)
 
 
 # The configuration of different hyper-parameters for training
-parser.add_argument("--rounds", type=int, default=50)
-parser.add_argument("--local_steps", type=int, default=20)
+parser.add_argument("--rounds", type=int, default=5)
+parser.add_argument("--local_steps", type=int, default=5)
 parser.add_argument("--batch_size", type=int, default=30)
 parser.add_argument("--test_bsz", type=int, default=128)
 parser.add_argument("--backend", type=str, default="gloo")
@@ -86,7 +86,7 @@ parser.add_argument("--decay_round", type=float, default=10)
 parser.add_argument("--num_loaders", type=int, default=2)
 parser.add_argument("--eval_interval", type=int, default=5)
 parser.add_argument("--sample_seed", type=int, default=233)  # 123 #233
-parser.add_argument("--test_ratio", type=float, default=1.0)
+parser.add_argument("--test_ratio", type=float, default=0.1)
 parser.add_argument("--loss_decay", type=float, default=0.2)
 parser.add_argument("--exploration_min", type=float, default=0.3)
 parser.add_argument("--cut_off_util", type=float, default=0.05)  # 95 percentile

@@ -56,10 +56,14 @@ class TensorflowClient(ClientBase):
         tf_dataset = self._convert_np_to_tf_dataset(client_data).take(conf.local_steps)
         history = model.fit(tf_dataset, batch_size=conf.batch_size, verbose=0)
 
+        loss_curve = history.history.get('loss', [])
         # Report the training results
         results = {'client_id': client_id,
                    'moving_loss': sum(history.history['loss']) / (len(history.history['loss']) + 1e-4),
-                   'trained_size': history.history['row_count'], 'success': True, 'utility': 1}
+                   'trained_size': history.history['row_count'], 'success': True, 'utility': 1,
+                   'loss_curve':  loss_curve,
+                   'success':     True,
+                   'utility':     1,}
 
         logging.info(f"Training of (CLIENT: {client_id}) completes, {results}")
 

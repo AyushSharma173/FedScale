@@ -66,17 +66,33 @@ class TorchClient(ClientBase):
 
         # NOTE: If one may hope to run fixed number of epochs, instead of iterations,
         # use `while self.completed_steps < conf.local_steps * len(client_data)` instead
-        while self.completed_steps < conf.local_steps:
-            try:
-                self.train_step(client_data, conf, model, optimizer, criterion)
-            except Exception as ex:
-                error_type = ex
-                break
+        # self.completed_steps = 0
+        # loss_curve = []
+        # print(f"Inside train for client {client_id} with completed steps {self.completed_steps} steps and local steps {conf.local_steps}")
+        # while self.completed_steps < conf.local_steps:
+        #     try:
+        #         step_loss = self.train_step(client_data, conf, model, optimizer, criterion)
+        #         print(f"Adding step_loss: {step_loss} to loss_curve")
+        #         loss_curve.append(step_loss)
+        #     except Exception as ex:
+        #         error_type = ex
+        #         logging.error(f"train_step blew up on iteration {self.completed_steps}: {ex}")
+        #         print(f"train_step blew up on iteration {self.completed_steps}: {ex}")
+        #         break
+
+        self.completed_steps = 0
+        loss_curve = self.train_step(client_data, conf, model, optimizer, criterion)
+
+
+        
 
         state_dicts = model.state_dict()
         model_param = {p: state_dicts[p].data.cpu().numpy()
                        for p in state_dicts}
-        results = {'client_id': client_id, 'moving_loss': self.epoch_train_loss,
+        
+        results = {'client_id': client_id, 
+                   'moving_loss': self.epoch_train_loss,
+                   'loss_curve': loss_curve,
                    'trained_size': self.completed_steps * conf.batch_size,
                    'success': self.completed_steps == conf.local_steps}
 
@@ -140,7 +156,10 @@ class TorchClient(ClientBase):
         return criterion
 
     def train_step(self, client_data, conf, model, optimizer, criterion):
-
+        logging.info(f"Starting train_step")
+        print(f"Starting train_step")
+        losses = []
+        self.completed_steps = 0
         for data_pair in client_data:
             if conf.task == 'nlp':
                 (data, _) = data_pair
@@ -220,6 +239,7 @@ class TorchClient(ClientBase):
                 loss = loss.mean()
 
             temp_loss = sum(loss_list) / float(len(loss_list))
+            losses.append(temp_loss)
             self.loss_squared = sum([l ** 2 for l in loss_list]
                                     ) / float(len(loss_list))
             # only measure the loss of the first epoch
@@ -243,6 +263,12 @@ class TorchClient(ClientBase):
 
             if self.completed_steps == conf.local_steps:
                 break
+        
+        print(f"losses: {losses}")
+        logging.info(f"losses: {losses}")
+        return losses
+
+
 
     @overrides
     def test(self, client_data, model, conf):

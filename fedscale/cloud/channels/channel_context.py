@@ -24,6 +24,12 @@ class ClientConnections(object):
             options=[
                 ('grpc.max_send_message_length', MAX_MESSAGE_LENGTH),
                 ('grpc.max_receive_message_length', MAX_MESSAGE_LENGTH),
+                # send a keep-alive ping every 60s
+                ('grpc.keepalive_time_ms',           300_000),
+                # if no pong in 20s, tear down the channel
+                ('grpc.keepalive_timeout_ms',        60_000),
+                # send pings even when there are no in-flight RPCs
+                ('grpc.keepalive_permit_without_calls', 1),
             ]
         )
         self.stub = job_api_pb2_grpc.JobServiceStub(self.channel)
